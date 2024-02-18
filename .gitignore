@@ -1,0 +1,12 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+Data/
+Metadata/
+/Data
+/Metadata
+Plots
+/Plots
+CIBERSORTx
+/CIBERSORTx

@@ -1,0 +1,175 @@
+---
+title: "Azenta70_processing"
+author: "Patrick Maclean"
+date: "2024-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Process bulk RNA-seq obtained from 70 SI samples submitted to Azenta in late 2023.
+60/70 libraries passed QC and have data available.
+
+- Process to counts matrix
+- Run sepstratifieR
+- Prepare for CIBERSORTx
+- Import CIBERSORTx results
+
+# Setup
+## Load packages
+```{r echo = T, results = 'hide', message = FALSE}
+library(clusterProfiler)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(biomaRt)
+library(SepstratifieR)
+library(janitor)
+library(DESeq2)
+library(edgeR)
+library(org.Hs.eg.db)
+library(table1)
+library(patchwork)
+library(msigdbr)
+library(tidyverse)
+library(lmerSeq)
+library(viridis)
+library(ggpubr)
+library(ggtext)
+library(ggforce)
+library(stringi)
+```
+
+## Set global plotting theme
+Use thematic package to set a custom colour theme for this analysis
+```{r results = 'hide', message = FALSE}
+library(scales)
+library(thematic)
+colour_sequence <- c("#35274A", "#F2300F","#0B775E","#E1BD6D")
+
+thematic_on(
+  bg = "auto", fg = "auto", accent = "auto", font = NA,
+  sequential = colour_sequence, qualitative = okabe_ito()
+)
+show_col(colour_sequence)
+
+theme_set(theme_bw() +
+        theme(axis.text.x = element_text(size = 10),
+              axis.text.y = element_text(size = 10)))
+```
+
+# Load data
+## Counts matrix
+nf-core RNA-seq v 3.1.0
+Raw counts, no length normalisation or cpm conversion
+Ensembl & HGNC identifiers
+
+Aligned with STAR, transcript-aware quantified with Salmon, then converted to gene-level counts with tx2gene
+
+Full results in BMRC: /gpfs2/well/jknight/projects/sepsis-immunomics/bulk-RNAseq/Azenta_70samples_Feb2024/processed/nfcore_RNAseq_3.10.1_ensembl
+
+```{r results = 'hide'}
+raw_counts <- read_delim("Data/Azenta70_salmon.merged.gene_counts.tsv", delim = "\t") %>% 
+  dplyr::rename(ensembl_id = gene_id, hgnc_id = gene_name)
+```
+
+## Metadata
+```{r}
+metadata <- read_delim("Metadata/Azenta60_samplesheet.csv") %>% 
+  mutate(Sample = gsub("-", ".", Sample),
+         Sample_ID = gsub("^UK02XX0+", "", Sample)) %>%
+  separate(Sample_ID, into = c("ID", "Timepoint", "Source"), remove = F)
+```
+
+# Process data
+## Create biomart object with protein coding genes
+This is a linkage table for the different gene nomenclature systems
+```{r results = 'hide'}
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+
+# create a lookup matrix using row names
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c("ensembl_gene_id",
+    "external_gene_name",
+    "entrezgene_id",
+    "gene_biotype"),
+  filter="ensembl_gene_id",
+  values=raw_counts$ensembl_id,
+  uniqueRows=TRUE)
+
+protein_coding_lookup <- annotLookup %>%
+  dplyr::select(external_gene_name, gene_biotype, ensembl_gene_id) %>%
+  dplyr::filter(gene_biotype == "protein_coding" | external_gene_name == "XIST")
+```
+
+## Label transcripts with HGNC identifiers and restrict to protein coding genes
+Remove duplicated or empty gene IDs
+```{r results = 'hide'}
+raw_counts_coding <- raw_counts %>% 
+  filter(hgnc_id == "XIST" | hgnc_id %in% protein_coding_lookup$external_gene_name) %>%
+  relocate(hgnc_id) %>%
+  select(-ensembl_id)
+```
+
+### Merge duplicated rows
+43 genes with multiple rows, collapse these into a single value
+```{r}
+raw_counts_coding <- raw_counts_coding %>% group_by(hgnc_id) %>% 
+  # Summarize the counts by taking the sum of each column for each group
+  summarize_all(.funs = sum) %>%
+  ungroup()
+```
+
+### Calculate library sizes 
+```{r}
+library_sizes <- raw_counts_coding %>% column_to_rownames(var = 'hgnc_id') %>% colSums() %>% as_tibble(rownames = 'Sample') %>% rename(library_size = value)
+
+metadata <- metadata %>% left_join(library_sizes)
+```
+
+## Create DGEList objects for raw and CPM values
+```{r results = 'hide'}
+raw_counts_matrix <- raw_counts_coding %>% column_to_rownames(var = "hgnc_id") %>% as.matrix()
+
+raw_counts_DGEList <- DGEList(counts=raw_counts_matrix,
+                              samples = metadata) 
+
+raw_counts_cpm_DGEList <- cpm(raw_counts_DGEList)
+raw_counts_log2cpm_DGEList <- cpm(raw_counts_DGEList, log = 2)
+```
+
+### Save for CIBERSORTx
+Filter for genes occuring with more than 10 average counts in more than 10 samples
+This reduces 19k genes to 14.3k
+Save as .tsv for input to CIBERSORTx wep app
+```{r results = 'hide'}
+CIBERSORT_threshold <- apply(raw_counts_matrix, 1, function(x) sum(x > 10) >= 10)
+
+raw_counts_CIBERSORT_filtered <- raw_counts_matrix[CIBERSORT_threshold, ]
+raw_counts_CIBERSORT_filtered <- raw_counts_CIBERSORT_filtered %>% as.data.frame() %>% rownames_to_column(., var = "Gene")
+
+write.table(raw_counts_CIBERSORT_filtered, "CIBERSORTx/Azenta70_CSx_counts.tsv",quote=FALSE, sep='\t', row.names = FALSE)
+```
+
+# QC plots
+## Library sizes
+```{r}
+metadata %>% mutate(label = case_when(library_size/1000000 < 20 ~ Sample_ID,
+                                      .default = NA)) %>%
+  ggplot(aes(x = Sample_ID, y = library_size/1000000, label = label, fill = Source)) +
+  geom_col(stat = 'count') +
+  geom_hline(yintercept = 25, linetype = 'dashed') +
+  geom_label_repel() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(x = "Samples",
+       y = "Library size (million PE reads",
+       title = "Library size",
+       subtitle = "Small libraries highlighted (<20 million PE reads)")
+ggsave('Plots/QC/library_size.pdf', height = 5, width = 6)
+```
+
