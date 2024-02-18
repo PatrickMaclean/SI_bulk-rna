@@ -40,6 +40,8 @@ library(ggpubr)
 library(ggtext)
 library(ggforce)
 library(stringi)
+library(plotly)
+library(broom)
 ```
 
 ## Set global plotting theme
@@ -72,15 +74,56 @@ Full results in BMRC: /gpfs2/well/jknight/projects/sepsis-immunomics/bulk-RNAseq
 
 ```{r results = 'hide'}
 raw_counts <- read_delim("Data/Azenta70_salmon.merged.gene_counts.tsv", delim = "\t") %>% 
-  dplyr::rename(ensembl_id = gene_id, hgnc_id = gene_name)
+  dplyr::rename(ensembl_id = gene_id, hgnc_id = gene_name) %>%
+  rename('RxN14.02.VaxWB' = 'RxN.14.02',
+         'RxN15.02.VaxWB' = 'RxN.15.02')
 ```
 
 ## Metadata
 ```{r}
 metadata <- read_delim("Metadata/Azenta60_samplesheet.csv") %>% 
   mutate(Sample = gsub("-", ".", Sample),
+         SI_ID = gsub("\\..*$", "", Sample),
          Sample_ID = gsub("^UK02XX0+", "", Sample)) %>%
   separate(Sample_ID, into = c("ID", "Timepoint", "Source"), remove = F)
+```
+
+```{r, include=FALSE}
+# SRS - in wide format, reshape to long, add ever SRS1 (SRSq not available here), then select only one row (don't know which day CH samples were from)
+# SI_SRS <- read_delim("Data/SI_SRS_wide.csv", delim = ",", col_names = T, na = c("", "NA", ".")) %>% 
+#   select(-Sex, -Age) %>% 
+#   reshape2::melt(id.vars = c("ID"), variable.name = "Day", value.name = "SRS") %>% 
+#   mutate(Day = gsub("D", "", Day)) %>% 
+#   mutate(SRS = ifelse(!is.na(SRS), paste0("SRS",SRS), SRS)) %>% 
+#   mutate(SRS = str_trim(SRS)) %>% 
+#   mutate(Day = as.double(Day)) %>% 
+#   group_by(ID) %>%
+#   mutate(SRS1_ever = ifelse(any(SRS == "SRS1", na.rm = TRUE), "Yes", "No")) %>%
+#   slice_head(n = 1) %>%
+#   select(-Day)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Demographic data
+SI_demographics <- read_delim("Metadata/SI_0.1_demographics.csv", delim = ",", col_names = T, na = c("", "NA", ".")) %>% select(ID, Age, Sex, `Ethnicity (patient)`) %>% dplyr::rename(Ethnicity = `Ethnicity (patient)`) %>% filter(grepl("UK02XX", ID))
+
+# Outcomes - recode any hospital death (yes/no)
+SI_outcomes <- read_delim("Metadata/SI_0.1_outcomes.csv", delim = ",", col_names = T, na = c("", "NA", ".")) %>%
+  select(ID, `Death in hospital`) %>%
+  dplyr::rename(hospital_death = `Death in hospital`) %>%
+  mutate(hospital_death = case_when(hospital_death == TRUE ~ 1,
+                                    hospital_death == FALSE ~ 0,
+                                    .default = NA)) %>%
+  mutate(hospital_death = as.factor(hospital_death))
+
+```
+
+```{r, include=FALSE}
+# Combine
+SI_metadata <- full_join(SI_demographics, SI_outcomes)
+
+# Add to main sheet
+metadata <- left_join(metadata, SI_metadata, by = c("SI_ID" = "ID"))
 ```
 
 # Process data
@@ -155,10 +198,62 @@ raw_counts_CIBERSORT_filtered <- raw_counts_CIBERSORT_filtered %>% as.data.frame
 write.table(raw_counts_CIBERSORT_filtered, "CIBERSORTx/Azenta70_CSx_counts.tsv",quote=FALSE, sep='\t', row.names = FALSE)
 ```
 
+### Import CIBERSORTx results
+Date: 2024-02-18 03:21:33
+Job type: Impute Cell Fractions
+Signature matrix file: CIBERSORTx_Job16_ref_matrix_equal_inferred_phenoclasses-CIBERSORTx_Job16_ref_matrix_equal_inferred_refsample-bm-K999.txt
+Mixture file: Azenta70_CSx_counts.tsv
+Batch correction: enabled
+Batch correction mode: S-mode
+Single cell reference matrix file used for S-mode batch correction: sc_ref_matrix.tsv
+Disable quantile normalization: true
+Run mode (relative or absolute): relative
+Permutations: 500
+```{r}
+
+```
+
+## SepstratifieR
+```{r}
+# Define gene lists
+davenport <- c("ARL14EP","CCNB1IP1","DYRK2","ADGRE3","MDC1","TDRD9","ZAP70")
+extended <- c("ARL14EP","CCNB1IP1","DYRK2","ADGRE3","MDC1","TDRD9","ZAP70","DNAJA3","NAT10","THOC1","MRPS9","PGS1","UBAP1","USP5","TTC3","SH3GLB1","BMS1","FBXO31", "SLC25A38")
+# define ensembl.id lists
+extended.ensembl <- c("ENSG00000144659", "ENSG00000103423", "ENSG00000135372", "ENSG00000079134", "ENSG00000135972", "ENSG00000087157", "ENSG00000165006", "ENSG00000111667", "ENSG00000182670", "ENSG00000097033", "ENSG00000165733", "ENSG00000103264", "ENSG00000152219", "ENSG00000100814", "ENSG00000127334", "ENSG00000131355", "ENSG00000137337", "ENSG00000156414", "ENSG00000115085")
+
+# Change count matrix to correct format - add Ensembl IDs as rownames, then transpose
+raw_counts_transposed <- raw_counts %>%
+  select(-hgnc_id) %>%
+  column_to_rownames(var = 'ensembl_id') %>% 
+  t()
+
+# Run sepstratifieR
+predictions.davenport <- stratifyPatients(raw_counts_transposed, gene_set = "davenport", k = 20)
+predictions.extended <- stratifyPatients(raw_counts_transposed, gene_set = "extended", k = 20)
+```
+### Add SRS predictions to metadata
+```{r results = 'hide'}
+# Collect predictions
+SRS.predictions <- cbind(predictions.davenport@SRS,
+                         predictions.davenport@SRSq,
+                         predictions.extended@SRS,
+                         predictions.extended@SRSq)
+colnames(SRS.predictions) <- c("SRS.davenport", "SRSq.davenport","SRS.extended", "SRSq.extended")
+SRS.predictions <- SRS.predictions %>% as.data.frame() %>% rownames_to_column(var = 'Sample')
+
+# Convert SRS to factor
+SRS.predictions$SRS.davenport <- factor(SRS.predictions$SRS.davenport)
+SRS.predictions$SRS.extended <- factor(SRS.predictions$SRS.extended)
+
+# Add to metadata
+metadata <- left_join(metadata, SRS.predictions, by = "Sample")
+```
+
 # QC plots
 ## Library sizes
 ```{r}
-metadata %>% mutate(label = case_when(library_size/1000000 < 20 ~ Sample_ID,
+metadata %>%
+  mutate(label = case_when(library_size/1000000 < 20 ~ Sample_ID,
                                       .default = NA)) %>%
   ggplot(aes(x = Sample_ID, y = library_size/1000000, label = label, fill = Source)) +
   geom_col(stat = 'count') +
@@ -167,9 +262,135 @@ metadata %>% mutate(label = case_when(library_size/1000000 < 20 ~ Sample_ID,
   theme(axis.text.x = element_blank(),
         axis.ticks.x = element_blank()) +
   labs(x = "Samples",
-       y = "Library size (million PE reads",
+       y = "Library size (million PE reads)",
        title = "Library size",
        subtitle = "Small libraries highlighted (<20 million PE reads)")
 ggsave('Plots/QC/library_size.pdf', height = 5, width = 6)
+```
+
+## Check expressed sex vs clinical sex
+```{r results = 'hide'}
+# Filter rows for sex-defining genes, then transpose for ggplot, then add metadata
+sex_genes <- t(dplyr::filter(as.data.frame(raw_counts_log2cpm_DGEList), rownames(raw_counts_log2cpm_DGEList) %in% c("XIST", "UTY")))
+
+sex_genes <- sex_genes %>% as.data.frame() %>% rownames_to_column(var = 'Sample') %>% left_join(metadata, ., by = join_by("Sample" == "Sample"))
+
+# Create new variable with predicted sex
+sex_genes <- dplyr::mutate(sex_genes, Sex.predicted = case_when(
+  XIST > 2 & UTY <2 ~ "Female",
+  XIST < 2 & UTY >2 ~ "Male", 
+  XIST > 2 & UTY >2 ~ "Indeterminate"
+))
+
+sex_genes <-  dplyr::mutate(sex_genes,
+                            Sex.discordance = case_when(Sex == Sex.predicted ~ "Match",
+                                                        Sex != Sex.predicted ~ "Discordant",
+                                                        .default = "No data"))
+```
+
+## Plot clinical vs genetic sex
+```{r results = 'hide'}
+sex_genes %>%
+  mutate(label = case_when(Sex.discordance == "Discordant" ~ Sample_ID,
+                           .default = NA)) %>%
+  ggplot(aes(x=XIST, y=UTY, color = Sex, label = label)) +
+  geom_point() +
+  geom_label_repel() + 
+  labs(x="XIST expression (log2cpm) ", y = "UTY expression (log2cpm)", title = "Sex-defining gene biplot (Azenta70)", color = "Sex (clinical database)")
+ggsave("Plots/QC/XIST_UTY_sex.png")
+```
+
+
+# General plots
+## SRS
+```{r}
+metadata %>% ggplot(aes(x = Timepoint, y = SRSq.extended, labels = Sample_ID)) +
+  geom_point() +
+  facet_wrap(~Source)
+ggplotly()
+```
+
+Overlapping WB/neut samples
+```{r}
+metadata %>% group_by(SI_ID) %>% filter(n() > 1) %>%
+  ggplot(aes(x = Timepoint, y = SRSq.extended, color = Source)) + 
+           geom_point() +
+  facet_wrap(~SI_ID)
+```
+
+## PCA
+Create DESeq2 object
+```{r results = 'hide'}
+counts_DESeq2 <- DESeqDataSetFromMatrix(countData = round(raw_counts_matrix),
+                              colData = metadata,
+                              design = ~SRS.extended
+)
+```
+
+Transform into VST-units
+```{r results = 'hide'}
+counts_vst <- vst(counts_DESeq2 , blind=FALSE)
+
+# Get 10k most variable genes
+counts_vst_matrix <- counts_vst@assays@data@listData[[1]] %>%
+  as_tibble(rownames = "Gene") %>%
+  rowwise() %>%
+  mutate(var = var(c_across(where(is.numeric)))) %>% 
+  ungroup() %>%
+  arrange(desc(var)) %>%
+  slice_head(n = 10000) %>%
+  select(-var) %>%
+  column_to_rownames(var = 'Gene') %>%
+  as.matrix() %>%
+  t() %>%
+  as_tibble(rownames = "Sample") %>% 
+  left_join(metadata)
+
+# PCA
+pca_fit <- counts_vst_matrix %>% 
+  select(any_of(rownames(raw_counts_matrix)), -Sample) %>% # retain only numeric columns
+  prcomp(center = T, scale. = T) # do PCA
+
+pca_fit %>%
+  tidy(matrix = "eigenvalues") %>%
+  filter(PC <= 20) %>%
+  ggplot(aes(PC, percent)) +
+  geom_col(fill = "#56B4E9", alpha = 0.8) +
+  scale_x_continuous(breaks = 1:20) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0.01))
+  ) 
+```
+
+PC1 looks like neut count / high NLR
+```{r}
+pca_fit %>%
+  augment(counts_vst_matrix) %>% # add original dataset back in
+  ggplot(aes(.fittedPC1, .fittedPC2, color = Sex)) + 
+  geom_point(size = 1.5)
+
+pca_fit %>%
+  augment(counts_vst_matrix) %>% # add original dataset back in
+  ggplot(aes(.fittedPC1, .fittedPC2, color = SRS.extended)) + 
+  geom_point(size = 1.5)
+
+pca_fit %>%
+  augment(counts_vst_matrix) %>% # add original dataset back in
+  ggplot(aes(.fittedPC1, .fittedPC2, color = library_size/1000000)) + 
+  geom_point(size = 1.5) +
+  scale_color_viridis_b()
+
+pca_fit %>%
+  augment(counts_vst_matrix) %>% # add original dataset back in
+  ggplot(aes(.fittedPC1, .fittedPC2, color = SRS.extended)) + 
+  geom_point(size = 1.5) +
+  facet_wrap(~Source)
+```
+
+# Save final results
+```{r}
+metadata %>% write_delim('Output/Azenta70_RNAseq_SRS_CSx_metadata.csv', delim = ',')
+#CIBERSORTx_results %>% write_delim('Output/Azenta70_CSx_counts.csv', delim = ',')
 ```
 
